@@ -187,6 +187,82 @@ api_json "/commits?limit=1&cursor=$CURSOR"
 info "按样本号检索（S2026-0002，看到两次更正的前后值）"
 api_json "/changes?sample_no=S2026-0002"
 
+# ------------------------------------------------------------ 冲突追溯
+section "F. 冲突追溯 /conflict-trace（重建截至提交位置的有效行）"
+
+info "F1. 插入同一样本/项目的第二条结果（先同值，不应判冲突）"
+src_sql < demo/sql/05_conflict_trace.sql
+sleep 3
+LSN_SAME=$(log_sql -c "SELECT max(commit_lsn)::text FROM source_commit WHERE slot_name='$SLOT_NAME';")
+info "同值并存事务提交位置: $LSN_SAME"
+api_json "/conflict-trace?sample_no=S2026-0002&test_item=%E8%A1%80%E7%B3%96&commit_lsn=$LSN_SAME"
+TRACE_SAME=$(api_get "/conflict-trace?sample_no=S2026-0002&test_item=%E8%A1%80%E7%B3%96&commit_lsn=$LSN_SAME")
+check "同值的两个不同 id 不报冲突" "no_conflict" \
+  "$(echo "$TRACE_SAME" | python3 -c 'import sys,json; print(json.load(sys.stdin)["conclusion"])')"
+check "同值时存在两条有效行" "2" \
+  "$(echo "$TRACE_SAME" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["rows"]))')"
+check "同值时无冲突轮起点" "None" \
+  "$(echo "$TRACE_SAME" | python3 -c 'import sys,json; print(json.load(sys.stdin)["conflict_round_first_commit_lsn"])')"
+
+info "F2. 把重复行改成不同值 -> 冲突成立，返回本轮首次成立位置"
+src_sql < demo/sql/06_conflict_diverge.sql
+sleep 3
+LSN_DIV=$(log_sql -c "SELECT max(commit_lsn)::text FROM source_commit WHERE slot_name='$SLOT_NAME';")
+info "异值事务提交位置（应等于冲突轮起点）: $LSN_DIV"
+TRACE_DIV=$(api_get "/conflict-trace?sample_no=S2026-0002&test_item=%E8%A1%80%E7%B3%96&commit_lsn=$LSN_DIV")
+api_json "/conflict-trace?sample_no=S2026-0002&test_item=%E8%A1%80%E7%B3%96&commit_lsn=$LSN_DIV"
+check "异值的两个不同 id 报冲突" "conflict" \
+  "$(echo "$TRACE_DIV" | python3 -c 'import sys,json; print(json.load(sys.stdin)["conclusion"])')"
+check "冲突轮首次成立位置精确到异值事务" "$LSN_DIV" \
+  "$(echo "$TRACE_DIV" | python3 -c 'import sys,json; print(json.load(sys.stdin)["conflict_round_first_commit_lsn"])')"
+check "返回两行不同结果值" "2" \
+  "$(echo "$TRACE_DIV" | python3 -c 'import sys,json; print(len({r["result"] for r in json.load(sys.stdin)["rows"]}))')"
+check "每行带最近变更位置" "$LSN_DIV" \
+  "$(echo "$TRACE_DIV" | python3 -c 'import sys,json; print(json.load(sys.stdin)["rows"][0]["last_change_commit_lsn"])')"
+
+info "F3. 截止点隔离：用旧位置 $LSN_SAME 查询，之后的异值变更不得混入"
+TRACE_OLD=$(api_get "/conflict-trace?sample_no=S2026-0002&test_item=%E8%A1%80%E7%B3%96&commit_lsn=$LSN_SAME")
+check "旧截止位置仍为无冲突" "no_conflict" \
+  "$(echo "$TRACE_OLD" | python3 -c 'import sys,json; print(json.load(sys.stdin)["conclusion"])')"
+check "截止点之后存在被排除的已采集事务" "True" \
+  "$(echo "$TRACE_OLD" | python3 -c 'import sys,json; print(json.load(sys.stdin)["ingested_after_cutoff"])')"
+
+info "F4. 建槽前基线行与覆盖范围说明"
+# S2026-0002/血糖的原始行建槽前已存在，建槽后才被更正 -> 必须标记为建槽前基线行
+check "原行被标记为建槽前基线行" "True" \
+  "$(echo "$TRACE_DIV" | python3 -c 'import sys,json; print(any(r["is_pre_slot_baseline"] for r in json.load(sys.stdin)["rows"]))')"
+check "覆盖范围说明声明建槽前不可见行" "True" \
+  "$(echo "$TRACE_DIV" | python3 -c 'import sys,json; print("建槽" in json.load(sys.stdin)["coverage"]["scope_note"])')"
+
+info "F5. 断链：制造日志缺口后，API 须提示 chain_broken 而非无冲突"
+# 取目标键下“原行”的 results.id（不是新插入的重复行）
+TARGET_ID=$(log_sql -c "SELECT (new_values->>'id') FROM result_change
+                         WHERE slot_name='$SLOT_NAME'
+                           AND new_values->>'sample_no'='S2026-0002'
+                           AND new_values->>'test_item'='血糖'
+                         ORDER BY commit_lsn ASC, change_seq ASC LIMIT 1;")
+info "抹掉 id=$TARGET_ID 的最新一条日志，制造变更链缺口"
+log_sql -v slot_name="$SLOT_NAME" -v target_id="$TARGET_ID" < demo/sql/07_make_gap.sql
+# 源库再做一次真实更正：其 old_values 承接源库真实上一值，但日志里该值已缺失
+src_sql -c "UPDATE results SET result='5.5', updated_at=now()
+             WHERE id=$TARGET_ID;"
+sleep 3
+LSN_GAP=$(log_sql -c "SELECT max(commit_lsn)::text FROM source_commit WHERE slot_name='$SLOT_NAME';")
+TRACE_GAP=$(api_get "/conflict-trace?sample_no=S2026-0002&test_item=%E8%A1%80%E7%B3%96&commit_lsn=$LSN_GAP")
+api_json "/conflict-trace?sample_no=S2026-0002&test_item=%E8%A1%80%E7%B3%96&commit_lsn=$LSN_GAP"
+check "缺口后结论为 chain_broken（不报无冲突）" "chain_broken" \
+  "$(echo "$TRACE_GAP" | python3 -c 'import sys,json; print(json.load(sys.stdin)["conclusion"])')"
+check "返回断链明细" "1" \
+  "$(echo "$TRACE_GAP" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["chain_breaks"]))')"
+
+info "F6. 错误处理：非法 LSN 400、未归档位置 404"
+check "非法 LSN 返回 400" "400" \
+  "$(docker compose exec -T api curl -s -o /dev/null -w '%{http_code}' \
+      'http://localhost:8000/conflict-trace?sample_no=x&test_item=y&commit_lsn=bad-lsn')"
+check "未归档位置返回 404" "404" \
+  "$(docker compose exec -T api curl -s -o /dev/null -w '%{http_code}' \
+      'http://localhost:8000/conflict-trace?sample_no=x&test_item=y&commit_lsn=0/FFFFFF')"
+
 section "结果"
 if [ "$FAIL" -eq 0 ]; then
   echo "全部断言通过 ✅  Swagger 文档: http://localhost:${API_PORT}/docs"
